@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools==81.0.0", "wheel==0.46.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocr-video-frame-sorting"
+version = "1.0.0"
+description = "Local chronological sorting of duplicated video frames without deleting files."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "fastapi==0.136.1",
+  "filelock==3.29.0",
+  "numpy==2.4.4",
+  "pillow==12.0.0",
+  "pydantic==2.13.3",
+  "uvicorn==0.46.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "coverage==7.15.4",
+  "httpx==0.28.1",
+  "pytest==9.0.2",
+  "pytest-cov==7.1.0",
+  "ruff==0.15.22",
+]
+
+[project.scripts]
+frame-sorter = "frame_sorter.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["frame_sorter*"]
+
+[tool.setuptools.package-data]
+"frame_sorter.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["frame_sorter"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
+[tool.ruff]
+target-version = "py314"

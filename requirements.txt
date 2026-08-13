@@ -1,0 +1,13 @@
+fastapi==0.136.1
+filelock==3.29.0
+coverage==7.15.4
+httpx==0.28.1
+numpy==2.4.4
+pillow==12.0.0
+pydantic==2.13.3
+pytest==9.0.2
+pytest-cov==7.1.0
+ruff==0.15.22
+setuptools==81.0.0
+uvicorn==0.46.0
+wheel==0.46.3

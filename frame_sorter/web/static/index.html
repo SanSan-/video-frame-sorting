@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f2eee5">
+  <title>Сортировка кадров видео</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">VF</div>
+        <div>
+          <h1 class="brand-title">Сортировка кадров видео</h1>
+          <p class="brand-sub">Локальная подготовка кадров и пересборка MP4 без вывода изображений</p>
+        </div>
+      </div>
+
+      <div class="directory-control">
+        <label for="folder">Каталог с JPEG-кадрами</label>
+        <div class="directory-row">
+          <input id="folder" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="Выберите каталог" aria-describedby="directoryHint">
+          <button id="pick" type="button" class="btn primary">Выбрать</button>
+          <button id="refresh" type="button" class="btn ghost" disabled>Обновить</button>
+        </div>
+        <p id="directoryHint" class="field-hint">
+          Найденные CSV и служебные файлы подтверждают уже пройденные этапы.
+        </p>
+      </div>
+    </header>
+
+    <main class="main-grid">
+      <section class="panel workflow-panel" aria-labelledby="workflowTitle">
+        <div class="panel-header">
+          <div>
+            <h2 id="workflowTitle" class="panel-title">Этапы обработки</h2>
+            <p class="panel-sub">Доступные действия определяются артефактами выбранного каталога.</p>
+          </div>
+          <span id="workflowSummary" class="status-summary" aria-live="polite">Каталог не выбран</span>
+        </div>
+
+        <div id="stageList" class="stage-list">
+          <article id="analysisStage" class="stage-card" data-state="idle" data-tone="neutral">
+            <span class="stage-number" aria-hidden="true">01</span>
+            <div class="stage-copy">
+              <div class="stage-heading">
+                <h3>Таблица сортировки</h3>
+                <span id="analysisState" class="stage-state">не проверено</span>
+              </div>
+              <p id="analysisDetail" class="stage-detail">Выберите каталог, чтобы проверить CSV и метаданные.</p>
+              <p id="analysisArtifact" class="stage-artifact" hidden></p>
+            </div>
+            <button id="analyze" type="button" class="btn ghost stage-action" disabled>Создать CSV</button>
+          </article>
+
+          <article id="renameStage" class="stage-card" data-state="idle" data-tone="neutral">
+            <span class="stage-number" aria-hidden="true">02</span>
+            <div class="stage-copy">
+              <div class="stage-heading">
+                <h3>Переименование кадров</h3>
+                <span id="renameState" class="stage-state">не проверено</span>
+              </div>
+              <p id="renameDetail" class="stage-detail">Состояние появится после проверки каталога.</p>
+              <p id="renameArtifact" class="stage-artifact" hidden></p>
+            </div>
+            <div class="stage-actions">
+              <button id="rename" type="button" class="btn danger stage-action" disabled>Переименовать</button>
+              <button id="undo" type="button" class="btn ghost stage-action"
+                      aria-describedby="renameDetail" hidden disabled>Вернуть имена</button>
+            </div>
+          </article>
+
+          <article id="rebuildStage" class="stage-card" data-state="idle" data-tone="neutral">
+            <span class="stage-number" aria-hidden="true">03</span>
+            <div class="stage-copy">
+              <div class="stage-heading">
+                <h3>Пересборка видео</h3>
+                <span id="rebuildState" class="stage-state">не проверено</span>
+              </div>
+              <p id="rebuildDetail" class="stage-detail">Сборка станет доступна после подтверждения сортировки кадров.</p>
+              <p id="rebuildArtifact" class="stage-artifact" hidden></p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel video-panel" aria-labelledby="videoTitle">
+        <div class="panel-header">
+          <div>
+            <h2 id="videoTitle" class="panel-title">Сборка MP4</h2>
+            <p class="panel-sub">Можно выбрать исходное видео и новое имя результата.</p>
+          </div>
+        </div>
+
+        <div class="video-form">
+          <div class="field">
+            <label for="original-video">Исходный MP4 со звуком</label>
+            <div class="path-row">
+              <input id="original-video" type="text" spellcheck="false" autocomplete="off"
+                     placeholder="По умолчанию определяется по каталогу">
+              <button id="pick-original-video" type="button" class="btn ghost" disabled>Выбрать</button>
+            </div>
+            <span class="field-hint">Необязательно: приложение попробует найти исходный MP4 автоматически.</span>
+          </div>
+
+          <div class="field">
+            <label for="output-video">Новый выходной MP4</label>
+            <div class="path-row">
+              <input id="output-video" type="text" spellcheck="false" autocomplete="off"
+                     placeholder="Выберите новое имя файла">
+              <button id="pick-output-video" type="button" class="btn ghost" disabled>Выбрать</button>
+            </div>
+            <span class="field-hint">Существующий файл не перезаписывается.</span>
+          </div>
+
+          <div class="privacy-note">
+            <span class="privacy-mark" aria-hidden="true"></span>
+            <p>Кадры обрабатываются локально. Браузер получает только пути, состояния и журнал.</p>
+          </div>
+
+          <button id="rebuild" type="button" class="btn success rebuild-action" disabled>Собрать MP4</button>
+        </div>
+      </section>
+    </main>
+
+    <section class="panel log-panel" aria-labelledby="logsTitle">
+      <div class="panel-header log-header">
+        <div class="log-heading">
+          <h2 id="logsTitle" class="panel-title">Журнал</h2>
+          <span id="terminalStatus" class="terminal-status idle" aria-live="polite">ожидание</span>
+        </div>
+        <button id="clearLogs" type="button" class="btn ghost compact">Очистить</button>
+      </div>
+      <div class="job-status-row">
+        <strong id="status">Готово к работе.</strong>
+        <span id="progress">0%</span>
+      </div>
+      <progress id="bar" max="100" value="0" aria-label="Прогресс текущей задачи"></progress>
+      <pre id="log" class="log-console" role="log" aria-live="polite" aria-atomic="false">Журнал пока пуст.</pre>
+    </section>
+  </div>
+
+  <script src="/static/app.js" type="module"></script>
+</body>
+</html>
