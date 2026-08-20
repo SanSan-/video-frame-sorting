@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import asdict, dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +20,7 @@ from frame_sorter.io_utils import validate_frames_directory
 FFPROBE_TIMEOUT_SECONDS = 10 * 60
 FFMPEG_TIMEOUT_SECONDS = 4 * 60 * 60
 _VIDEO_TIME_BASE = "1:90000"
+_VIDEO_TIME_BASE_DENOMINATOR = 90_000
 _MANIFEST_FRAME_RATE = "90000"
 _STDERR_TAIL_LIMIT = 8 * 1024
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -159,7 +160,9 @@ def rebuild_video(
             manifest_path,
             source,
             temporary_output,
+            frame_count,
             source_timing.total_duration,
+            source_timing.durations[-1],
             source_duration if source_has_audio else source_timing.total_duration,
             audio_timestamp_repair,
         )
@@ -518,7 +521,8 @@ def _write_concat_manifest(
         lines.append(f"option framerate {_MANIFEST_FRAME_RATE}")
         lines.append(f"duration {_decimal_text(duration)}")
     # Повтор последнего файла даёт concat-демультиплексору конечную метку длительности.
-    # Видео-фильтр trim ниже исключает служебный повтор по конечной метке времени.
+    # trim исключает служебный повтор, а video setts ниже возвращает последнему реальному
+    # пакету исходную длительность: MP4 иначе сокращает её до одного тика 1/90000.
     lines.append(_concat_file_line(frames[-1]))
     lines.append(f"option framerate {_MANIFEST_FRAME_RATE}")
     try:
@@ -557,7 +561,9 @@ def _run_ffmpeg(
     manifest: Path,
     source: Path,
     temporary_output: Path,
+    frame_count: int,
     video_duration: Decimal,
+    last_frame_duration: Decimal,
     container_duration: Decimal,
     audio_timestamp_repair: _AudioTimestampRepair | None,
 ) -> None:
@@ -597,6 +603,8 @@ def _run_ffmpeg(
         "passthrough",
         "-enc_time_base:v",
         _VIDEO_TIME_BASE,
+        "-bsf:v",
+        _last_video_packet_duration_filter(frame_count, last_frame_duration),
     ]
     command.extend(["-c:a", "copy"])
     if audio_timestamp_repair is not None:
@@ -612,11 +620,43 @@ def _run_ffmpeg(
             ]
         )
     if audio_timestamp_repair is None:
-        command.extend(["-t", _decimal_text(container_duration)])
+        # Длительность контейнера Samsung иногда заканчивается на несколько миллисекунд
+        # раньше PTS последнего видеокадра. Глобальный -t не должен отрезать этот кадр.
+        output_limit = max(container_duration, video_duration)
+        command.extend(["-t", _decimal_text(output_limit)])
     command.extend(
         ["-movflags", "+faststart", "-y", os.fspath(temporary_output)]
     )
     _run_command(command, timeout=FFMPEG_TIMEOUT_SECONDS, operation="ffmpeg")
+
+
+def _last_video_packet_duration_filter(
+    frame_count: int,
+    last_frame_duration: Decimal,
+) -> str:
+    """Фиксирует длительность последнего H.264-пакета в шкале 1/90000."""
+    if frame_count < 1:
+        raise VideoRebuildError("Некорректна длительность последнего видеокадра.")
+    duration_ticks = _last_video_duration_ticks(last_frame_duration)
+    last_packet = frame_count - 1
+    return (
+        "setts=duration="
+        f"if(eq(N\\,{last_packet})\\,{duration_ticks}\\,DURATION)"
+    )
+
+
+def _last_video_duration_ticks(last_frame_duration: Decimal) -> int:
+    """Квантует длительность последнего кадра как FFmpeg video setts."""
+    if not last_frame_duration.is_finite() or last_frame_duration <= 0:
+        raise VideoRebuildError("Некорректна длительность последнего видеокадра.")
+    return max(
+        1,
+        int(
+            (last_frame_duration * _VIDEO_TIME_BASE_DENOMINATOR).to_integral_value(
+                rounding=ROUND_HALF_UP
+            )
+        ),
+    )
 
 
 def _run_command(
@@ -682,6 +722,37 @@ def _verify_rebuilt_video(
     output_timing: _FrameTiming,
     output_duration: Decimal,
 ) -> None:
+    _verify_audio_preserved(source_probe, source_has_audio, output_probe)
+    _verify_video_timestamps(source_timing, output_timing)
+    _verify_last_frame_duration(source_timing, output_probe, output_timing)
+    expected_video_duration = source_timing.total_duration
+    video_tolerance = max(Decimal("0.050"), expected_video_duration * Decimal("0.002"))
+    if abs(output_timing.total_duration - expected_video_duration) > video_tolerance:
+        raise VideoRebuildError(
+            "Проверка итогового видео не пройдена: длительность видеоряда отличается "
+            f"от исходной временной шкалы ({_decimal_text(output_timing.total_duration)} "
+            f"вместо {_decimal_text(expected_video_duration)} с)."
+        )
+    expected_container_duration = source_duration if source_has_audio else expected_video_duration
+    container_tolerance = max(
+        Decimal("0.100"),
+        expected_container_duration * Decimal("0.01"),
+    )
+    if abs(output_duration - expected_container_duration) > container_tolerance:
+        delta = abs(output_duration - expected_container_duration)
+        raise VideoRebuildError(
+            "Проверка итогового видео не пройдена: длительность контейнера отличается "
+            f"от ожидаемой: получено {_decimal_text(output_duration)} с, ожидалось "
+            f"{_decimal_text(expected_container_duration)} с, разница "
+            f"{_decimal_text(delta)} с, допуск {_decimal_text(container_tolerance)} с."
+        )
+
+
+def _verify_audio_preserved(
+    source_probe: _MediaProbe,
+    source_has_audio: bool,
+    output_probe: _MediaProbe,
+) -> None:
     output_has_audio = output_probe.audio_stream_count > 0
     if output_has_audio != source_has_audio:
         expected = "присутствовать" if source_has_audio else "отсутствовать"
@@ -703,6 +774,12 @@ def _verify_rebuilt_video(
                 "Проверка итогового видео не пройдена: число аудиосэмплов отличается "
                 f"от исходного ({output_samples} вместо {source_samples})."
             )
+
+
+def _verify_video_timestamps(
+    source_timing: _FrameTiming,
+    output_timing: _FrameTiming,
+) -> None:
     timestamp_tolerance = Decimal("0.001")
     for position, (source_pts, output_pts) in enumerate(
         zip(
@@ -716,26 +793,35 @@ def _verify_rebuilt_video(
                 "Проверка итогового видео не пройдена: метка времени кадра "
                 f"{position} отличается от исходной."
             )
-    expected_video_duration = source_timing.total_duration
-    video_tolerance = max(Decimal("0.050"), expected_video_duration * Decimal("0.002"))
-    if abs(output_timing.total_duration - expected_video_duration) > video_tolerance:
+
+
+def _verify_last_frame_duration(
+    source_timing: _FrameTiming,
+    output_probe: _MediaProbe,
+    output_timing: _FrameTiming,
+) -> None:
+    output_time_base = _fraction_decimal(output_probe.video_stream.get("time_base"))
+    if output_time_base is None or output_time_base <= 0:
         raise VideoRebuildError(
-            "Проверка итогового видео не пройдена: длительность видеоряда отличается "
-            f"от исходной временной шкалы ({_decimal_text(output_timing.total_duration)} "
-            f"вместо {_decimal_text(expected_video_duration)} с)."
+            "Проверка итогового видео не пройдена: ffprobe не вернул корректную "
+            "временную базу видеопотока."
         )
-    expected_container_duration = source_duration if source_has_audio else expected_video_duration
-    container_tolerance = max(
-        Decimal("0.100"),
-        expected_container_duration * Decimal("0.01"),
+    last_frame_duration_tolerance = output_time_base / 2 + Decimal("0.000001")
+    expected_last_frame_duration = (
+        Decimal(_last_video_duration_ticks(source_timing.durations[-1]))
+        / _VIDEO_TIME_BASE_DENOMINATOR
     )
-    if abs(output_duration - expected_container_duration) > container_tolerance:
-        delta = abs(output_duration - expected_container_duration)
+    actual_last_frame_duration = output_timing.durations[-1]
+    if (
+        abs(actual_last_frame_duration - expected_last_frame_duration)
+        > last_frame_duration_tolerance
+    ):
         raise VideoRebuildError(
-            "Проверка итогового видео не пройдена: длительность контейнера отличается "
-            f"от ожидаемой: получено {_decimal_text(output_duration)} с, ожидалось "
-            f"{_decimal_text(expected_container_duration)} с, разница "
-            f"{_decimal_text(delta)} с, допуск {_decimal_text(container_tolerance)} с."
+            "Проверка итогового видео не пройдена: длительность последнего кадра "
+            f"отличается от исходной: получено "
+            f"{_decimal_text(actual_last_frame_duration)} с, ожидалось "
+            f"{_decimal_text(expected_last_frame_duration)} с, допуск "
+            f"{_decimal_text(last_frame_duration_tolerance)} с."
         )
 
 

@@ -19,6 +19,7 @@ frame-sort-plan.csv
 frame-sort-plan.meta.json
 frame-sort-undo-*.csv
 .frame-sort-state/
+*.mp4
 *.md
 !README.md
 !PRD.md

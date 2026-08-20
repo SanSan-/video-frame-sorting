@@ -145,6 +145,9 @@ def test_rebuild_uses_natural_order_and_publishes_verified_mp4(
     assert _option(ffmpeg_command, "-pix_fmt") == "yuv420p"
     assert _option(ffmpeg_command, "-fps_mode:v") == "passthrough"
     assert _option(ffmpeg_command, "-enc_time_base:v") == "1:90000"
+    assert _option(ffmpeg_command, "-bsf:v") == (
+        "setts=duration=if(eq(N\\,2)\\,3420\\,DURATION)"
+    )
     assert _option(ffmpeg_command, "-vf") == "trim=end=0.120"
     assert "-frames:v" not in ffmpeg_command
     assert _option(ffmpeg_command, "-c:a") == "copy"
@@ -166,6 +169,44 @@ def test_rebuild_uses_natural_order_and_publishes_verified_mp4(
         for event in events
     )
     assert events[-1]["phase"] == "completed"
+
+
+def test_ffmpeg_output_limit_cannot_precede_video_timeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run_command(
+        command: list[str],
+        *,
+        timeout: int,
+        operation: str,
+    ) -> subprocess.CompletedProcess[str]:
+        assert timeout == video.FFMPEG_TIMEOUT_SECONDS
+        assert operation == "ffmpeg"
+        commands.append(list(command))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(video, "_run_command", fake_run_command)
+
+    video._run_ffmpeg(
+        "ffmpeg",
+        tmp_path / "frames.ffconcat",
+        tmp_path / "source.mp4",
+        tmp_path / "output.mp4",
+        3,
+        video.Decimal("0.280000"),
+        video.Decimal("0.200000"),
+        video.Decimal("0.060000"),
+        None,
+    )
+
+    command = commands[0]
+    assert _option(command, "-t") == "0.280000"
+    assert _option(command, "-bsf:v") == (
+        "setts=duration=if(eq(N\\,2)\\,18000\\,DURATION)"
+    )
 
 
 def test_inconsistent_aac_timestamps_trigger_sample_preserving_normalization(
@@ -229,6 +270,9 @@ def test_inconsistent_aac_timestamps_trigger_sample_preserving_normalization(
 
     command = next(item for item in commands if Path(item[0]).stem.casefold() == "ffmpeg")
     assert _option(command, "-c:a") == "copy"
+    assert _option(command, "-bsf:v") == (
+        "setts=duration=if(eq(N\\,0)\\,3600\\,DURATION)"
+    )
     assert _option(command, "-bsf:a") == (
         "setts=pts=N*1024:dts=N*1024:duration=1024:time_base=1/16000"
     )
@@ -276,7 +320,7 @@ def test_output_verification_rejects_lost_audio_frames() -> None:
         reported_duration=video.Decimal("0.192"),
     )
     output_probe = video._MediaProbe(
-        video_stream={"index": 0},
+        video_stream={"index": 0, "time_base": "1/90000"},
         video_frames=({},),
         audio_stream_count=1,
         audio_stream={"index": 1},
@@ -301,6 +345,116 @@ def test_output_verification_rejects_lost_audio_frames() -> None:
         )
 
 
+def test_output_verification_rejects_collapsed_last_frame_duration() -> None:
+    source_probe = video._MediaProbe(
+        video_stream={"index": 0},
+        video_frames=({}, {}),
+        audio_stream_count=0,
+        audio_stream=None,
+        audio_frames=(),
+        reported_duration=video.Decimal("0.080000"),
+    )
+    output_probe = video._MediaProbe(
+        video_stream={"index": 0, "time_base": "1/90000"},
+        video_frames=({}, {}),
+        audio_stream_count=0,
+        audio_stream=None,
+        audio_frames=(),
+        reported_duration=video.Decimal("0.080000"),
+    )
+    source_timing = video._FrameTiming(
+        normalized_pts=(video.Decimal("0"), video.Decimal("0.040000")),
+        durations=(video.Decimal("0.040000"), video.Decimal("0.040000")),
+    )
+    collapsed_timing = video._FrameTiming(
+        normalized_pts=(video.Decimal("0"), video.Decimal("0.040000")),
+        durations=(video.Decimal("0.040000"), video.Decimal("0.000011")),
+    )
+    source_duration = video.Decimal("0.080000")
+    output_duration = video.Decimal("0.080000")
+
+    with pytest.raises(VideoRebuildError, match="длительность последнего кадра"):
+        video._verify_rebuilt_video(
+            source_probe=source_probe,
+            source_timing=source_timing,
+            source_duration=source_duration,
+            source_has_audio=False,
+            output_probe=output_probe,
+            output_timing=collapsed_timing,
+            output_duration=output_duration,
+        )
+
+
+def test_output_verification_rejects_video_timestamp_shift() -> None:
+    source_timing = video._FrameTiming(
+        normalized_pts=(video.Decimal("0"), video.Decimal("0.040000")),
+        durations=(video.Decimal("0.040000"), video.Decimal("0.040000")),
+    )
+    shifted_timing = video._FrameTiming(
+        normalized_pts=(video.Decimal("0"), video.Decimal("0.041001")),
+        durations=(video.Decimal("0.041001"), video.Decimal("0.040000")),
+    )
+
+    with pytest.raises(VideoRebuildError, match="кадра 1"):
+        video._verify_video_timestamps(source_timing, shifted_timing)
+
+
+def test_output_verification_accepts_last_frame_duration_within_output_tick() -> None:
+    probe = video._MediaProbe(
+        video_stream={"index": 0, "time_base": "1/90000"},
+        video_frames=({}, {}),
+        audio_stream_count=0,
+        audio_stream=None,
+        audio_frames=(),
+        reported_duration=video.Decimal("0.080000"),
+    )
+    source_timing = video._FrameTiming(
+        normalized_pts=(video.Decimal("0"), video.Decimal("0.040000")),
+        durations=(video.Decimal("0.040000"), video.Decimal("0.040000")),
+    )
+    rounded_timing = video._FrameTiming(
+        normalized_pts=(video.Decimal("0"), video.Decimal("0.040000")),
+        durations=(video.Decimal("0.040000"), video.Decimal("0.039994")),
+    )
+
+    video._verify_rebuilt_video(
+        source_probe=probe,
+        source_timing=source_timing,
+        source_duration=video.Decimal("0.080000"),
+        source_has_audio=False,
+        output_probe=probe,
+        output_timing=rounded_timing,
+        output_duration=video.Decimal("0.080000"),
+    )
+
+
+def test_output_verification_rejects_missing_video_time_base() -> None:
+    probe = video._MediaProbe(
+        video_stream={"index": 0},
+        video_frames=({},),
+        audio_stream_count=0,
+        audio_stream=None,
+        audio_frames=(),
+        reported_duration=video.Decimal("0.040000"),
+    )
+    timing = video._FrameTiming(
+        normalized_pts=(video.Decimal("0"),),
+        durations=(video.Decimal("0.040000"),),
+    )
+    duration = video.Decimal("0.040000")
+
+    with pytest.raises(VideoRebuildError, match="временную базу"):
+        video._verify_rebuilt_video(
+            source_probe=probe,
+            source_timing=timing,
+            source_duration=duration,
+            source_has_audio=False,
+            output_probe=probe,
+            output_timing=timing,
+            output_duration=duration,
+        )
+
+
 def test_container_duration_error_contains_diagnostics() -> None:
     source_probe = video._MediaProbe(
         video_stream={"index": 0},
@@ -319,7 +473,7 @@ def test_container_duration_error_contains_diagnostics() -> None:
         durations=(video.Decimal("52.373333"),),
     )
     output_probe = video._MediaProbe(
-        video_stream={"index": 0},
+        video_stream={"index": 0, "time_base": "1/90000"},
         video_frames=({"media_type": "video", "stream_index": 0},),
         audio_stream_count=1,
         audio_stream={"index": 1, "codec_type": "audio"},
@@ -499,7 +653,7 @@ def test_real_ffmpeg_rebuilds_small_video(tmp_path: Path) -> None:
             "-f",
             "lavfi",
             "-i",
-            "sine=frequency=440:sample_rate=48000:duration=0.40",
+            "sine=frequency=440:sample_rate=48000:duration=0.48",
             "-map",
             "0:v:0",
             "-map",
@@ -510,8 +664,14 @@ def test_real_ffmpeg_rebuilds_small_video(tmp_path: Path) -> None:
             "vfr",
             "-c:v",
             "libx264",
+            "-bf",
+            "0",
             "-pix_fmt",
             "yuv420p",
+            "-enc_time_base:v",
+            "1:90000",
+            "-bsf:v",
+            "setts=duration=if(eq(N\\,3)\\,10800\\,DURATION)",
             "-c:a",
             "aac",
             "-shortest",
@@ -538,9 +698,17 @@ def test_real_ffmpeg_rebuilds_small_video(tmp_path: Path) -> None:
     assert expected_count == 4
 
     result = rebuild_video(folder, original_video=original, output_video=output)
+    output_probe = video._probe_media(output, video._resolve_tool("ffprobe"))
+    output_timing = video._frame_timing(
+        output_probe,
+        expected_count=expected_count,
+        output=True,
+    )
 
     assert result.frame_count == expected_count
     assert result.audio_copied is True
+    assert output_timing.durations[-1] == video.Decimal("0.120000")
+    assert output_timing.total_duration == video.Decimal("0.480000")
     assert output.is_file()
     assert output.stat().st_size > 0
 
