@@ -6,6 +6,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .codex/
+.agents/
 .scannerwork/
 .coverage
 coverage.xml
@@ -23,3 +24,7 @@ frame-sort-undo-*.csv
 *.md
 !README.md
 !PRD.md
+!AGENTS.md
+!**/openspec/**/*.md
+sonar-project.properties
+**/evidence/**
