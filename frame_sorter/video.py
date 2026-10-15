@@ -31,6 +31,14 @@ class VideoRebuildError(FrameSorterError):
     """Ошибка запуска FFmpeg либо проверки созданного видео."""
 
 
+class _CommandFailedError(VideoRebuildError):
+    """Отказ внешнего процесса с сохранённой ограниченной диагностикой."""
+
+    def __init__(self, message: str, stderr: str) -> None:
+        super().__init__(message)
+        self.stderr = stderr
+
+
 @dataclass(frozen=True)
 class VideoRebuildResult:
     """Проверенный результат атомарно завершённой пересборки."""
@@ -62,6 +70,7 @@ class _MediaProbe:
     audio_stream: dict[str, Any] | None
     audio_frames: tuple[dict[str, Any], ...]
     reported_duration: Decimal | None
+    start_time: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True)
@@ -105,7 +114,7 @@ def rebuild_video(
         total=frame_count,
         message="Проверяется временная шкала исходного видео.",
     )
-    source_probe = _probe_media(source, ffprobe)
+    source_probe = _probe_media(source, ffprobe, ffmpeg=ffmpeg)
     source_timing = _frame_timing(
         source_probe,
         expected_count=frame_count,
@@ -114,6 +123,12 @@ def rebuild_video(
     source_duration = source_probe.reported_duration or source_timing.total_duration
     source_has_audio = source_probe.audio_stream_count > 0
     audio_timestamp_repair = _audio_timestamp_repair(source_probe)
+    selected_duration = _selected_output_duration(source_probe, source_timing, audio_timestamp_repair)
+    audio_stream_index = (
+        _integer(source_probe.audio_stream.get("index"), "индекс аудиопотока")
+        if source_probe.audio_stream is not None
+        else None
+    )
     _emit(
         emit_event,
         type="media_probe",
@@ -165,6 +180,7 @@ def rebuild_video(
             source_timing.durations[-1],
             source_duration if source_has_audio else source_timing.total_duration,
             audio_timestamp_repair,
+            audio_stream_index,
         )
         _emit(
             emit_event,
@@ -201,7 +217,7 @@ def rebuild_video(
         _verify_rebuilt_video(
             source_probe=source_probe,
             source_timing=source_timing,
-            source_duration=source_duration,
+            source_duration=selected_duration,
             source_has_audio=source_has_audio,
             output_probe=output_probe,
             output_timing=output_timing,
@@ -293,7 +309,7 @@ def _resolve_tool(name: str) -> str:
     return executable
 
 
-def _probe_media(path: Path, ffprobe: str) -> _MediaProbe:
+def _probe_media(path: Path, ffprobe: str, *, ffmpeg: str | None = None) -> _MediaProbe:
     command = [
         ffprobe,
         "-v",
@@ -306,7 +322,7 @@ def _probe_media(path: Path, ffprobe: str) -> _MediaProbe:
             "start_time,time_base,avg_frame_rate,"
             "r_frame_rate:frame=media_type,stream_index,pts_time,"
             "best_effort_timestamp_time,pkt_duration_time,duration_time,"
-            "nb_samples:format=duration"
+            "nb_samples:format=duration,start_time"
         ),
         "-show_streams",
         "-show_frames",
@@ -331,33 +347,23 @@ def _probe_media(path: Path, ffprobe: str) -> _MediaProbe:
     if video_stream is None:
         raise VideoRebuildError(f"В видео нет видеопотока: {path.name}")
     stream_index = _integer(video_stream.get("index"), "индекс видеопотока")
-    video_frames = tuple(
-        frame
-        for frame in frames
-        if isinstance(frame, dict)
-        and frame.get("media_type") == "video"
-        and _optional_integer(frame.get("stream_index")) == stream_index
-    )
-    audio_stream_count = sum(
-        isinstance(stream, dict) and stream.get("codec_type") == "audio"
+    video_frames = _stream_frames(frames, "video", stream_index)
+    audio_streams = tuple(
+        stream
         for stream in streams
+        if isinstance(stream, dict) and stream.get("codec_type") == "audio"
     )
-    audio_stream = next(
-        (stream for stream in streams if isinstance(stream, dict) and stream.get("codec_type") == "audio"),
-        None,
+    audio_stream = (
+        _select_audio_stream(path, audio_streams, ffmpeg)
+        if ffmpeg is not None
+        else next(iter(audio_streams), None)
     )
     audio_stream_index = (
         _optional_integer(audio_stream.get("index"))
         if audio_stream is not None
         else None
     )
-    audio_frames = tuple(
-        frame
-        for frame in frames
-        if isinstance(frame, dict)
-        and frame.get("media_type") == "audio"
-        and _optional_integer(frame.get("stream_index")) == audio_stream_index
-    )
+    audio_frames = _stream_frames(frames, "audio", audio_stream_index)
     format_data = payload.get("format")
     format_duration = (
         _positive_decimal(format_data.get("duration"))
@@ -375,11 +381,116 @@ def _probe_media(path: Path, ffprobe: str) -> _MediaProbe:
     return _MediaProbe(
         video_stream=video_stream,
         video_frames=video_frames,
-        audio_stream_count=audio_stream_count,
+        audio_stream_count=len(audio_streams),
         audio_stream=audio_stream,
         audio_frames=audio_frames,
         reported_duration=reported_duration,
+        start_time=(
+            _finite_decimal(format_data.get("start_time")) or Decimal(0)
+            if isinstance(format_data, dict)
+            else Decimal(0)
+        ),
     )
+
+
+def _stream_frames(
+    frames: list[Any], media_type: str, stream_index: int | None,
+) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        frame
+        for frame in frames
+        if isinstance(frame, dict)
+        and frame.get("media_type") == media_type
+        and _optional_integer(frame.get("stream_index")) == stream_index
+    )
+
+
+def _select_audio_stream(
+    source: Path,
+    streams: tuple[dict[str, Any], ...],
+    ffmpeg: str,
+) -> dict[str, Any] | None:
+    """Выбирает первый поток, допускающий копирование в MP4 данным FFmpeg."""
+    if not streams:
+        return None
+    rejection = ""
+    with tempfile.TemporaryDirectory(prefix="frame-sort-audio-") as directory:
+        temporary_output = Path(directory) / "audio.mp4"
+        for stream in streams:
+            stream_index = _integer(stream.get("index"), "индекс аудиопотока")
+            if stream_index < 0:
+                raise VideoRebuildError("ffprobe вернул отрицательный индекс аудиопотока.")
+            command = [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-i", os.fspath(source), "-map", f"0:{stream_index}",
+                "-map_metadata", "-1", "-map_chapters", "-1", "-c:a", "copy",
+                "-frames:a", "1", "-f", "mp4", "-y", os.fspath(temporary_output),
+            ]
+            try:
+                _run_command(command, timeout=FFPROBE_TIMEOUT_SECONDS, operation="ffmpeg")
+            except _CommandFailedError as exc:
+                if not _unsupported_audio_format(exc.stderr):
+                    raise
+                rejection = str(exc)
+            else:
+                return stream
+    raise VideoRebuildError(
+        "Ни один аудиопоток не совместим с копированием в MP4 без перекодирования. "
+        f"Последний отказ: {rejection}"
+    )
+
+
+def _unsupported_audio_format(stderr: str) -> bool:
+    """Отделяет явный отказ MP4 от ошибок данных, запуска и файловой системы."""
+    return any(
+        marker in stderr
+        for marker in (
+            "codec not currently supported in container",
+            "is not standard, to mux anyway set strict",
+            "in MP4 support is experimental",
+        )
+    )
+
+
+def _selected_output_duration(
+    probe: _MediaProbe,
+    timing: _FrameTiming,
+    repair: _AudioTimestampRepair | None = None,
+) -> Decimal:
+    """Не переносит длительность отброшенных аудиодорожек на новый контейнер."""
+    if probe.audio_stream is None:
+        return timing.total_duration
+    if probe.audio_stream_count == 1:
+        return probe.reported_duration or timing.total_duration
+    if repair is not None:
+        audio_duration = Decimal(len(probe.audio_frames) * repair.samples_per_packet) / repair.sample_rate
+        return max(timing.total_duration, audio_duration)
+    audio_start = _finite_decimal(probe.audio_stream.get("start_time"))
+    audio_start = probe.start_time if audio_start is None else audio_start
+    duration = _positive_decimal(probe.audio_stream.get("duration"))
+    if duration is not None:
+        audio_end = audio_start + duration
+    elif probe.audio_frames:
+        last_frame = probe.audio_frames[-1]
+        last_duration = _audio_frame_duration(last_frame, probe.audio_stream)
+        if last_duration is None:
+            raise VideoRebuildError("Не удалось определить длительность выбранного аудиопотока.")
+        audio_end = _frame_timestamp(last_frame, len(probe.audio_frames) - 1) + last_duration
+    else:
+        raise VideoRebuildError("Не удалось определить длительность выбранного аудиопотока.")
+    return max(timing.total_duration, audio_end - probe.start_time)
+
+
+def _audio_frame_duration(frame: dict[str, Any], stream: dict[str, Any]) -> Decimal | None:
+    duration = (
+        _positive_decimal(frame.get("duration_time"))
+        or _positive_decimal(frame.get("pkt_duration_time"))
+    )
+    if duration is not None:
+        return duration
+    samples = _positive_decimal(frame.get("nb_samples"))
+    sample_rate = _positive_decimal(stream.get("sample_rate"))
+    return samples / sample_rate if samples and sample_rate else None
 
 
 def _audio_timestamp_repair(probe: _MediaProbe) -> _AudioTimestampRepair | None:
@@ -566,6 +677,7 @@ def _run_ffmpeg(
     last_frame_duration: Decimal,
     container_duration: Decimal,
     audio_timestamp_repair: _AudioTimestampRepair | None,
+    audio_stream_index: int | None = None,
 ) -> None:
     command = [
         ffmpeg,
@@ -583,8 +695,6 @@ def _run_ffmpeg(
         os.fspath(source),
         "-map",
         "0:v:0",
-        "-map",
-        "1:a:0?",
         "-map_metadata",
         "1",
         "-map_chapters",
@@ -606,7 +716,8 @@ def _run_ffmpeg(
         "-bsf:v",
         _last_video_packet_duration_filter(frame_count, last_frame_duration),
     ]
-    command.extend(["-c:a", "copy"])
+    if audio_stream_index is not None:
+        command.extend(["-map", f"1:{audio_stream_index}", "-c:a", "copy"])
     if audio_timestamp_repair is not None:
         samples = audio_timestamp_repair.samples_per_packet
         sample_rate = audio_timestamp_repair.sample_rate
@@ -698,8 +809,8 @@ def _run_command(
             detail or "описание ошибки отсутствует",
         )
         suffix = f": {detail}" if detail else "."
-        raise VideoRebuildError(
-            f"{operation} завершился с кодом {completed.returncode}{suffix}"
+        raise _CommandFailedError(
+            f"{operation} завершился с кодом {completed.returncode}{suffix}", detail
         )
     logger.info("%s завершён успешно за %.3f с.", operation, elapsed)
     return completed
@@ -727,24 +838,23 @@ def _verify_rebuilt_video(
     _verify_last_frame_duration(source_timing, output_probe, output_timing)
     expected_video_duration = source_timing.total_duration
     video_tolerance = max(Decimal("0.050"), expected_video_duration * Decimal("0.002"))
-    if abs(output_timing.total_duration - expected_video_duration) > video_tolerance:
-        raise VideoRebuildError(
-            "Проверка итогового видео не пройдена: длительность видеоряда отличается "
-            f"от исходной временной шкалы ({_decimal_text(output_timing.total_duration)} "
-            f"вместо {_decimal_text(expected_video_duration)} с)."
-        )
+    _verify_duration("видеоряда", output_timing.total_duration, expected_video_duration, video_tolerance)
     expected_container_duration = source_duration if source_has_audio else expected_video_duration
     container_tolerance = max(
         Decimal("0.100"),
         expected_container_duration * Decimal("0.01"),
     )
-    if abs(output_duration - expected_container_duration) > container_tolerance:
-        delta = abs(output_duration - expected_container_duration)
+    _verify_duration("контейнера", output_duration, expected_container_duration, container_tolerance)
+
+
+def _verify_duration(label: str, actual: Decimal, expected: Decimal, tolerance: Decimal) -> None:
+    delta = abs(actual - expected)
+    if delta > tolerance:
         raise VideoRebuildError(
-            "Проверка итогового видео не пройдена: длительность контейнера отличается "
-            f"от ожидаемой: получено {_decimal_text(output_duration)} с, ожидалось "
-            f"{_decimal_text(expected_container_duration)} с, разница "
-            f"{_decimal_text(delta)} с, допуск {_decimal_text(container_tolerance)} с."
+            f"Проверка итогового видео не пройдена: длительность {label} отличается "
+            f"от ожидаемой: получено {_decimal_text(actual)} с, ожидалось "
+            f"{_decimal_text(expected)} с, разница {_decimal_text(delta)} с, "
+            f"допуск {_decimal_text(tolerance)} с."
         )
 
 
@@ -812,17 +922,10 @@ def _verify_last_frame_duration(
         / _VIDEO_TIME_BASE_DENOMINATOR
     )
     actual_last_frame_duration = output_timing.durations[-1]
-    if (
-        abs(actual_last_frame_duration - expected_last_frame_duration)
-        > last_frame_duration_tolerance
-    ):
-        raise VideoRebuildError(
-            "Проверка итогового видео не пройдена: длительность последнего кадра "
-            f"отличается от исходной: получено "
-            f"{_decimal_text(actual_last_frame_duration)} с, ожидалось "
-            f"{_decimal_text(expected_last_frame_duration)} с, допуск "
-            f"{_decimal_text(last_frame_duration_tolerance)} с."
-        )
+    _verify_duration(
+        "последнего кадра", actual_last_frame_duration,
+        expected_last_frame_duration, last_frame_duration_tolerance,
+    )
 
 
 def _audio_sample_count(frames: tuple[dict[str, Any], ...]) -> int | None:

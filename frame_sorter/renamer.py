@@ -13,6 +13,7 @@ from typing import Any, Callable, NoReturn
 
 from filelock import FileLock, Timeout
 
+from frame_sorter.analysis import ALGORITHM_VERSION
 from frame_sorter.exceptions import TransactionError, ValidationError
 from frame_sorter.io_utils import (
     STATE_DIRECTORY_NAME,
@@ -335,6 +336,8 @@ def _validated_metadata(sequence: FrameSequence, plan_path: Path) -> dict[str, A
     metadata = _read_json(metadata_path)
     if metadata.get("schema_version") != 1:
         raise ValidationError("Версия метаданных плана не поддерживается.")
+    if metadata.get("algorithm_version") not in (ALGORITHM_VERSION, "undo-v1"):
+        raise ValidationError("Версия алгоритма плана не поддерживается; выполните новый анализ.")
     if not isinstance(metadata.get("plan_id"), str) or not metadata["plan_id"]:
         raise ValidationError("Метаданные не содержат корректный plan_id.")
     if metadata.get("folder") != str(sequence.folder):

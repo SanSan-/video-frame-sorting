@@ -24,7 +24,7 @@
    Связь отмены задаёт [REN-005](../../specs/rename-transactions/spec.md), готовность каталога —
    [WEB-004](../../specs/local-web-workflow/spec.md).
 
-4. **Файл MP4 существует, но аудиоданные или последний интервал потеряны.**
+4. **Потеря аудиокадров или длительности последнего кадра.**
    В [test_video.py](../../../tests/test_video.py) тесты `test_output_verification_rejects_lost_audio_frames`
    и `test_output_verification_rejects_collapsed_last_frame_duration` отклоняют соответствующие нарушения.
    Контракты: [VID-003/006](../../specs/video-rebuild/spec.md).
@@ -50,3 +50,28 @@
    сначала проверяет отсутствие файла БД без явного режима веб-запуска. Затем явный запуск восстанавливает задачу
    со статусом `interrupted` и подключает хранилище; после завершения сессии хранилище освобождено.
    Контракт: [WEB-006](../../specs/local-web-workflow/spec.md#requirement-web-006-sse-и-ограниченная-история).
+
+8. **Прямое переименование по устаревшему плану.**
+   В [test_web_app.py](../../../tests/test_web_app.py) тест
+   `test_direct_rename_rejects_stale_algorithm_without_changing_frames` передаёт согласованный план версии
+   `local-return-v1` в подтверждённый `POST /api/rename`. Принятая задача получает `failed`; имена и хеши JPEG
+   сохраняются, журнал и обратный CSV не создаются. В [test_renamer.py](../../../tests/test_renamer.py)
+   `test_plan_algorithm_is_checked_before_transaction` проверяет тот же отказ при предварительном просмотре
+   и применении для устаревшей, отсутствующей и некорректной версии. Контракты:
+   [REN-002](../../specs/rename-transactions/spec.md), [WEB-004](../../specs/local-web-workflow/spec.md).
+
+9. **Следующая совместимая аудиодорожка с настоящим FFmpeg.**
+   В [test_video.py](../../../tests/test_video.py) тест `test_real_ffmpeg_selects_later_aac_from_mov_named_mp4`
+   создаёт синтетический MOV с расширением `.mp4`: первая дорожка PCM μ-law длится 0,8 с, следующая AAC и четыре
+   видеокадра — 0,16 с. Результат содержит AAC выбранного потока с тем же числом аудиокадров и сэмплов; длительность
+   проверяется как 0,16 с с допуском 0,025 с, исходный файл сохраняется. Этот тест требует установленных FFmpeg
+   и ffprobe; их отсутствие означает `SKIPPED`, а не подтверждённую пересборку.
+   `test_inconsistent_aac_timestamps_trigger_sample_preserving_normalization` отдельно проверяет нормализацию
+   выбранной AAC-дорожки с индексом 3 при неподдерживаемой первой. Контракты:
+   [VID-005/006](../../specs/video-rebuild/spec.md).
+
+10. **Полная диагностика длительности.**
+    В [test_video.py](../../../tests/test_video.py) тест
+    `test_duration_errors_include_actual_expected_delta_and_tolerance` проверяет сообщения о сокращённом
+    последнем кадре и увеличенной длительности видеоряда: фактическое и ожидаемое значения, абсолютную разницу
+    и допуск в секундах. Контракт: [VID-008](../../specs/video-rebuild/spec.md).

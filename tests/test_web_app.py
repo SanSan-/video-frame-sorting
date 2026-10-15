@@ -157,6 +157,36 @@ def test_only_one_background_job_is_active(tmp_path: Path, monkeypatch) -> None:
     assert _wait(client, first.json()["job_id"])["status"] == "completed"
 
 
+def test_direct_rename_rejects_stale_algorithm_without_changing_frames(
+    frame_directory: Path,
+) -> None:
+    from frame_sorter.io_utils import atomic_write_json
+    from frame_sorter.service import analyze_folder
+    from tests.conftest import content_hashes
+
+    analysis = analyze_folder(frame_directory)
+    metadata = json.loads(analysis.metadata_path.read_text(encoding="utf-8"))
+    metadata["algorithm_version"] = "local-return-v1"
+    atomic_write_json(analysis.metadata_path, metadata)
+    before = content_hashes(frame_directory)
+    client = TestClient(web_app.app)
+
+    started = client.post(
+        "/api/rename",
+        headers=ORIGIN,
+        json={"folder": str(frame_directory), "confirm": True},
+    )
+
+    assert started.status_code == 202
+    completed = _wait(client, started.json()["job_id"])
+    assert completed["status"] == "failed"
+    assert "новый анализ" in completed["error"]
+    assert content_hashes(frame_directory) == before
+    assert not (frame_directory / ".frame-sort-state").exists()
+    assert not list(frame_directory.glob(".frame-sort-*.tmp"))
+    assert not list(frame_directory.glob("frame-sort-undo-*.csv"))
+
+
 def test_rebuild_requires_rename_confirmation_and_new_output(tmp_path: Path, monkeypatch) -> None:
     service = FakeService()
     monkeypatch.setattr(web_app, "service_api", service)

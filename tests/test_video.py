@@ -101,6 +101,9 @@ def test_rebuild_uses_natural_order_and_publishes_verified_mp4(
                 stderr="",
             )
         assert executable == "ffmpeg"
+        if "-frames:a" in command:
+            Path(command[-1]).write_bytes(b"audio-header")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         first_input = command.index("-i") + 1
         manifest_path = Path(command[first_input])
         manifest_bytes = manifest_path.read_bytes()
@@ -135,9 +138,9 @@ def test_rebuild_uses_natural_order_and_publishes_verified_mp4(
     assert manifest.count("option framerate 90000") == 4
     assert manifest_path is not None and not manifest_path.exists()
     assert temporary_output is not None and not temporary_output.exists()
-    ffmpeg_command = next(command for command, _kwargs in calls if Path(command[0]).stem == "ffmpeg")
+    ffmpeg_command = next(command for command, _kwargs in calls if "-bsf:v" in command)
     assert _option(ffmpeg_command, "-map", occurrence=1) == "0:v:0"
-    assert _option(ffmpeg_command, "-map", occurrence=2) == "1:a:0?"
+    assert _option(ffmpeg_command, "-map", occurrence=2) == "1:1"
     assert _option(ffmpeg_command, "-map_metadata") == "1"
     assert _option(ffmpeg_command, "-c:v") == "libx264"
     assert _option(ffmpeg_command, "-bf") == "0"
@@ -209,9 +212,11 @@ def test_ffmpeg_output_limit_cannot_precede_video_timeline(
     )
 
 
+@pytest.mark.parametrize("unsupported_first", [False, True], ids=["first-aac", "later-aac"])
 def test_inconsistent_aac_timestamps_trigger_sample_preserving_normalization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unsupported_first: bool,
 ) -> None:
     folder = tmp_path / "frames"
     folder.mkdir()
@@ -253,11 +258,30 @@ def test_inconsistent_aac_timestamps_trigger_sample_preserving_normalization(
         }
         for index in range(3)
     )
+    selected_index = 3 if unsupported_first else 1
+    if unsupported_first:
+        source_payload["format"]["duration"] = "60.000000"
+        source_payload["streams"][1]["index"] = selected_index
+        source_payload["streams"][1]["start_time"] = "12.000000"
+        for frame in source_payload["frames"]:
+            if frame["media_type"] == "audio":
+                frame["stream_index"] = selected_index
+        source_payload["streams"].insert(
+            1, {"index": 1, "codec_type": "audio", "codec_name": "pcm_mulaw"}
+        )
+        source_payload["frames"].append(
+            {"media_type": "audio", "stream_index": 1, "nb_samples": 9000}
+        )
     commands: list[list[str]] = []
 
     def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         commands.append(list(command))
         if Path(command[0]).stem.casefold() == "ffmpeg":
+            if unsupported_first and any(value in command for value in ("0:1", "1:a:0?")):
+                return subprocess.CompletedProcess(
+                    command, 1, stdout="",
+                    stderr="codec not currently supported in container",
+                )
             Path(command[-1]).write_bytes(b"rebuilt")
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         payload = output_payload if command[-1].endswith(".building.mp4") else source_payload
@@ -268,7 +292,8 @@ def test_inconsistent_aac_timestamps_trigger_sample_preserving_normalization(
 
     result = rebuild_video(folder)
 
-    command = next(item for item in commands if Path(item[0]).stem.casefold() == "ffmpeg")
+    command = next(item for item in commands if "-bsf:v" in item)
+    assert _option(command, "-map", occurrence=2) == f"1:{selected_index}"
     assert _option(command, "-c:a") == "copy"
     assert _option(command, "-bsf:v") == (
         "setts=duration=if(eq(N\\,0)\\,3600\\,DURATION)"
@@ -278,6 +303,178 @@ def test_inconsistent_aac_timestamps_trigger_sample_preserving_normalization(
     )
     assert "-t" not in command
     assert result.audio_timestamps_repaired is True
+    assert result.source_duration_seconds == (60.0 if unsupported_first else 0.192)
+    assert result.output_duration_seconds == 0.192
+
+
+@pytest.mark.parametrize(
+    ("actual_duration", "time_base", "label", "expected", "delta", "tolerance"),
+    [
+        ("0.000011", "1/90000", "последнего кадра", "0.04", "0.039989", "0.000006555555555555555555555555555"),
+        ("0.200000", "1/1", "видеоряда", "0.080000", "0.160000", "0.050"),
+    ],
+    ids=["last-frame", "video-timeline"],
+)
+def test_duration_errors_include_actual_expected_delta_and_tolerance(
+    actual_duration: str,
+    time_base: str,
+    label: str,
+    expected: str,
+    delta: str,
+    tolerance: str,
+) -> None:
+    probe = video._MediaProbe(
+        video_stream={"index": 0, "time_base": time_base},
+        video_frames=({}, {}), audio_stream_count=0, audio_stream=None,
+        audio_frames=(), reported_duration=video.Decimal("0.080000"),
+    )
+    source_timing = video._FrameTiming(
+        normalized_pts=(video.Decimal("0"), video.Decimal("0.040000")),
+        durations=(video.Decimal("0.040000"), video.Decimal("0.040000")),
+    )
+    output_timing = video._FrameTiming(
+        normalized_pts=source_timing.normalized_pts,
+        durations=(video.Decimal("0.040000"), video.Decimal(actual_duration)),
+    )
+    container_duration = video.Decimal("0.080000")
+    with pytest.raises(VideoRebuildError) as caught:
+        video._verify_rebuilt_video(
+            source_probe=probe, source_timing=source_timing,
+            source_duration=container_duration, source_has_audio=False,
+            output_probe=probe, output_timing=output_timing,
+            output_duration=container_duration,
+        )
+    actual = actual_duration if label == "последнего кадра" else "0.240000"
+    message = str(caught.value)
+    assert label in message
+    assert f"получено {actual} с" in message
+    assert f"ожидалось {expected} с" in message
+    assert f"разница {delta} с" in message
+    assert f"допуск {tolerance} с" in message
+
+
+@pytest.mark.parametrize(
+    ("codecs", "rejected", "selected_index"),
+    [
+        ([], [], None),
+        (["alac", "aac"], [], 1),
+        (["pcm_mulaw", "aac"], [1], 2),
+        (["pcm_mulaw", "pcm_alaw"], [1, 2], None),
+    ],
+    ids=["no-audio", "first-compatible", "later-compatible", "all-unsupported"],
+)
+def test_audio_selection_preserves_first_compatible_stream_or_rejects_all(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    codecs: list[str],
+    rejected: list[int],
+    selected_index: int | None,
+) -> None:
+    folder = tmp_path / "frames"
+    folder.mkdir()
+    (folder / "one.jpg").write_bytes(b"jpeg")
+    original = tmp_path / "frames.mp4"
+    original.write_bytes(b"source")
+    payload = _probe_payload(["0.000"], duration="0.040", audio=False)
+    payload["streams"].extend(
+        {"index": index, "codec_type": "audio", "codec_name": codec, "duration": "0.040"}
+        for index, codec in enumerate(codecs, start=1)
+    )
+    if len(codecs) > 1:
+        payload["format"]["duration"] = "60.000000"
+    output_payload = _probe_payload(["0.000"], duration="0.040", audio=bool(codecs))
+    commands: list[list[str]] = []
+    temporary_paths: list[Path] = []
+
+    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(list(command))
+        if Path(command[0]).stem.casefold() == "ffprobe":
+            data = output_payload if command[-1].endswith(".building.mp4") else payload
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(data), stderr="")
+        path = Path(command[-1])
+        temporary_paths.append(path)
+        if "-frames:a" in command and int(_option(command, "-map").split(":")[1]) in rejected:
+            return subprocess.CompletedProcess(
+                command, 1, stdout="", stderr="codec not currently supported in container"
+            )
+        path.write_bytes(b"rebuilt")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    _install_tools(monkeypatch)
+    monkeypatch.setattr(video.subprocess, "run", fake_run)
+    if codecs and selected_index is None:
+        with pytest.raises(VideoRebuildError, match="Ни один аудиопоток"):
+            rebuild_video(folder)
+        assert not (tmp_path / "frames_sorted.mp4").exists()
+        assert all("-bsf:v" not in command for command in commands)
+    else:
+        result = rebuild_video(folder)
+        assert result.audio_copied is bool(codecs)
+        rebuild = next(command for command in commands if "-bsf:v" in command)
+        assert _option(rebuild, "-t") == ("60.000000" if len(codecs) > 1 else "0.040")
+        maps = [rebuild[index + 1] for index, value in enumerate(rebuild) if value == "-map"]
+        assert maps == (["0:v:0", f"1:{selected_index}"] if codecs else ["0:v:0"])
+    attempts = [_option(command, "-map") for command in commands if "-frames:a" in command]
+    assert attempts == [f"0:{index}" for index in rejected + ([selected_index] if selected_index else [])]
+    assert all(not path.exists() for path in temporary_paths)
+    assert original.read_bytes() == b"source"
+
+
+@pytest.mark.parametrize("failure", ["corrupt-data", "timeout", "launch"])
+def test_audio_probe_failure_does_not_skip_to_another_track(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    payload = _probe_payload(["0.000"], duration="0.040", audio=True)
+    payload["streams"].append(
+        {"index": 2, "codec_type": "audio", "codec_name": "aac", "duration": "0.040"}
+    )
+    attempts: list[str] = []
+
+    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if command[0] == "ffprobe":
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+        attempts.append(_option(command, "-map"))
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, 1)
+        if failure == "launch":
+            raise OSError("запуск недоступен")
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="Invalid data found when processing input")
+
+    monkeypatch.setattr(video.subprocess, "run", fake_run)
+    with pytest.raises(VideoRebuildError):
+        video._probe_media(tmp_path / "source.mp4", "ffprobe", ffmpeg="ffmpeg")
+    assert attempts == ["0:1"]
+
+
+@pytest.mark.parametrize(
+    ("stream", "frames", "expected"),
+    [
+        ({"start_time": "11", "duration": "3"}, (), "4"),
+        ({"duration": "3"}, (), "3"),
+        ({}, ({"pts_time": "13", "duration_time": "0.5"},), "3.5"),
+        ({}, ({"pts_time": "13", "pkt_duration_time": "0.5"},), "3.5"),
+        ({"sample_rate": "10"}, ({"pts_time": "13", "nb_samples": 1},), "3.1"),
+        ({}, (), None),
+        ({}, ({"pts_time": "13"},), None),
+    ],
+    ids=["stream-offset", "container-offset", "frame-duration", "packet-duration", "samples", "no-duration", "incomplete-frame"],
+)
+def test_selected_audio_duration_excludes_discarded_track(
+    stream: dict[str, Any], frames: tuple[dict[str, Any], ...], expected: str | None,
+) -> None:
+    probe = video._MediaProbe(
+        video_stream={"index": 0}, video_frames=({},), audio_stream_count=2,
+        audio_stream={"index": 2, **stream}, audio_frames=frames,
+        reported_duration=video.Decimal("60"), start_time=video.Decimal("10"),
+    )
+    timing = video._FrameTiming(
+        normalized_pts=(video.Decimal("0"),), durations=(video.Decimal("2"),),
+    )
+    if expected is None:
+        with pytest.raises(VideoRebuildError, match="длительность выбранного аудиопотока"):
+            video._selected_output_duration(probe, timing)
+    else:
+        assert video._selected_output_duration(probe, timing) == video.Decimal(expected)
 
 
 def test_consistent_aac_timestamps_keep_plain_stream_copy() -> None:
@@ -711,6 +908,56 @@ def test_real_ffmpeg_rebuilds_small_video(tmp_path: Path) -> None:
     assert output_timing.total_duration == video.Decimal("0.480000")
     assert output.is_file()
     assert output.stat().st_size > 0
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="FFmpeg не установлен",
+)
+def test_real_ffmpeg_selects_later_aac_from_mov_named_mp4(tmp_path: Path) -> None:
+    """MOV с расширением .mp4 содержит неподдерживаемый в MP4 μ-law перед AAC."""
+    ffmpeg = video._resolve_tool("ffmpeg")
+    ffprobe = video._resolve_tool("ffprobe")
+    folder = tmp_path / "frames"
+    folder.mkdir()
+    original = tmp_path / "mov-source.mp4"
+    output = tmp_path / "selected-audio.mp4"
+    _run_real([
+        ffmpeg, "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc2=size=96x64:rate=25:duration=0.16",
+        "-f", "lavfi", "-i", "sine=frequency=220:sample_rate=8000:duration=0.80",
+        "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=0.16",
+        "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0",
+        "-c:v", "libx264", "-bf", "0", "-pix_fmt", "yuv420p",
+        "-c:a:0", "pcm_mulaw", "-c:a:1", "aac", "-f", "mov", "-y", str(original),
+    ])
+    _run_real([
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(original),
+        "-map", "0:v:0", "-fps_mode:v", "passthrough", str(folder / "%03d.jpg"),
+    ])
+    original_bytes = original.read_bytes()
+    unselected_probe = video._probe_media(original, ffprobe)
+    assert unselected_probe.audio_stream is not None
+    assert unselected_probe.audio_stream["codec_name"] == "pcm_mulaw"
+    assert unselected_probe.reported_duration == video.Decimal("0.800000")
+
+    result = rebuild_video(folder, original_video=original, output_video=output)
+
+    selected_probe = video._probe_media(original, ffprobe, ffmpeg=ffmpeg)
+    output_probe = video._probe_media(output, ffprobe)
+    assert selected_probe.audio_stream is not None
+    assert selected_probe.audio_stream["index"] == 2
+    assert selected_probe.audio_stream["codec_name"] == "aac"
+    assert output_probe.audio_stream is not None
+    assert output_probe.audio_stream["codec_name"] == "aac"
+    assert len(output_probe.audio_frames) == len(selected_probe.audio_frames)
+    assert video._audio_sample_count(output_probe.audio_frames) == video._audio_sample_count(selected_probe.audio_frames)
+    assert result.frame_count == 4
+    assert result.audio_copied is True
+    assert result.source_duration_seconds == 0.8
+    assert result.output_duration_seconds == pytest.approx(0.16, abs=0.025)
+    assert original.read_bytes() == original_bytes
+    assert output.is_file()
 
 
 def _option(command: list[str], name: str, *, occurrence: int = 1) -> str:

@@ -83,6 +83,31 @@ def test_modified_csv_is_rejected(frame_directory: Path, tmp_path: Path) -> None
         preview_rename(frame_directory, plan)
 
 
+@pytest.mark.parametrize("operation", [preview_rename, apply_rename])
+@pytest.mark.parametrize("algorithm_version", ["local-return-v1", None, []])
+def test_plan_algorithm_is_checked_before_transaction(
+    frame_directory: Path,
+    operation,
+    algorithm_version,
+) -> None:
+    analysis = analyze_folder(frame_directory)
+    metadata = json.loads(analysis.metadata_path.read_text(encoding="utf-8"))
+    if algorithm_version is None:
+        metadata.pop("algorithm_version")
+    else:
+        metadata["algorithm_version"] = algorithm_version
+    renamer.atomic_write_json(analysis.metadata_path, metadata)
+    before = content_hashes(frame_directory)
+
+    with pytest.raises(ValidationError, match="новый анализ"):
+        operation(frame_directory, analysis.csv_path)
+
+    assert content_hashes(frame_directory) == before
+    assert not (frame_directory / ".frame-sort-state").exists()
+    assert not list(frame_directory.glob(".frame-sort-*.tmp"))
+    assert not list(frame_directory.glob("frame-sort-undo-*.csv"))
+
+
 def test_csv_with_extra_field_is_rejected(
     frame_directory: Path, tmp_path: Path
 ) -> None:
